@@ -1,109 +1,74 @@
-# bot.py — crash-hardened, SLASH-ONLY, no privileged intents, no aiofiles
+# bot_minimal.py — slash-only safe minimal (overwrite bot.py)
 import os
-import json
 import logging
-from typing import Optional, Tuple
-
 import discord
 from discord.ext import commands
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
-log = logging.getLogger("translator-slash")
+log = logging.getLogger("translator-min")
 
-# ---------- Intents (SAFE) ----------
-# Use discord.Intents (NOT commands.Intents). Do NOT enable message_content here.
 intents = discord.Intents.default()
-intents.message_content = False  # must be False unless your app has the privileged intent enabled
+intents.message_content = False  # MUST be False — no privileged intents
 bot = commands.Bot(command_prefix=".", intents=intents)
 
-SETTINGS_FILE = "settings.json"
-
-# ---------- simple sync settings (no aiofiles) ----------
-def load_settings() -> dict:
-    try:
-        with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except FileNotFoundError:
-        return {}
-    except Exception as e:
-        log.warning("Failed to load settings.json: %s", e)
-        return {}
-
-def save_settings(data: dict):
-    try:
-        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
-    except Exception as e:
-        log.error("Failed to save settings.json: %s", e)
-
-async def ensure_settings_loaded():
-    if not hasattr(bot, "settings"):
-        bot.settings = load_settings()
-
-async def get_channel_cfg(guild_id: int, channel_id: int) -> dict:
-    await ensure_settings_loaded()
-    g = str(guild_id)
-    c = str(channel_id)
-    if g not in bot.settings:
-        bot.settings[g] = {}
-    if c not in bot.settings[g]:
-        bot.settings[g][c] = {"lang": "en", "autotranslate": False}
-    return bot.settings[g][c]
-
-# Remove default help to avoid duplicate registration issues
-try:
-    bot.remove_command("help")
-except Exception:
-    pass  # if not present, ignore
-
-# ---------- utility: translator wrapper (delayed import) ----------
-def translate_with_available_libs(text: str, dest: str = "en") -> Tuple[str, str]:
-    """
-    Try googletrans then deep-translator.
-    Returns (translated_text, source_lang).
-    Raises RuntimeError if no translator libs available.
-    """
-    # googletrans first
-    try:
-        from googletrans import Translator as GT_Translator
-        tr = GT_Translator()
-        res = tr.translate(text, dest=dest)
-        return res.text, getattr(res, "src", "auto")
-    except Exception as e:
-        log.debug("googletrans not available or failed: %s", e)
-
-    # fallback deep-translator
-    try:
-        from deep_translator import GoogleTranslator as DT_Translator
-        res_text = DT_Translator(source="auto", target=dest).translate(text)
-        return res_text, "auto"
-    except Exception as e:
-        log.debug("deep-translator not available or failed: %s", e)
-
-    raise RuntimeError("No translation library available (install googletrans or deep-translator)")
-
-# ---------- Events ----------
 @bot.event
 async def on_ready():
-    await ensure_settings_loaded()
-    log.info("Logged in as %s (id:%s)", bot.user, bot.user.id)
-
-    # Try guild sync if provided for instant slash availability
+    log.info("Bot online: %s (id:%s)", bot.user, bot.user.id)
     guild_id = os.getenv("GUILD_ID")
     if guild_id:
         try:
-            guild_obj = discord.Object(id=int(guild_id))
-            await bot.tree.sync(guild=guild_obj)
-            log.info("Slash commands synced (guild %s)", guild_id)
+            g = discord.Object(id=int(guild_id))
+            await bot.tree.sync(guild=g)
+            log.info("Slash commands synced to guild %s", guild_id)
             return
         except Exception as e:
             log.warning("Guild sync failed: %s", e)
     try:
         await bot.tree.sync()
-        log.info("Slash commands synced (global)")
+        log.info("Global slash sync attempted")
     except Exception as e:
         log.warning("Global sync failed: %s", e)
 
+@bot.tree.command(name="help", description="Show help (ephemeral).")
+async def slash_help(interaction: discord.Interaction):
+    await interaction.response.send_message("Translator slash-only bot is online. Use /t <message_id> <lang>.", ephemeral=True)
+
+@bot.tree.command(name="t", description="Translate a message by ID (ephemeral).")
+async def slash_t(interaction: discord.Interaction, message_id: str, lang: str = "en", channel: discord.TextChannel = None):
+    await interaction.response.defer(ephemeral=True)
+    try:
+        mid = int(message_id)
+    except:
+        await interaction.followup.send("Message ID must be numeric.", ephemeral=True)
+        return
+    target_channel = channel or interaction.channel
+    try:
+        msg = await target_channel.fetch_message(mid)
+    except Exception:
+        await interaction.followup.send("Message not found in that channel.", ephemeral=True)
+        return
+    if not getattr(msg, "content", None):
+        await interaction.followup.send("Target message has no text.", ephemeral=True)
+        return
+    # delayed import to avoid startup crashes if libs missing
+    try:
+        from googletrans import Translator
+        tr = Translator()
+        res = tr.translate(msg.content, dest=lang)
+        await interaction.followup.send(f"**Translation ({getattr(res,'src','auto')} → {lang})**\n{res.text}", ephemeral=True)
+    except Exception as e:
+        try:
+            from deep_translator import GoogleTranslator
+            translated = GoogleTranslator(source="auto", target=lang).translate(msg.content)
+            await interaction.followup.send(f"**Translation (auto → {lang})**\n{translated}", ephemeral=True)
+        except Exception:
+            await interaction.followup.send("Translation libraries not available or failed.", ephemeral=True)
+
+if __name__ == "__main__":
+    TOKEN = os.getenv("TOKEN")
+    if not TOKEN:
+        raise SystemExit("TOKEN not set")
+    bot.run(TOKEN)
 # ---------- Slash commands (safe) ----------
 @bot.tree.command(name="t", description="Translate a message by ID (ephemeral to you).")
 @discord.app_commands.describe(message_id="ID of the message to translate", channel="Channel containing the message (optional)", lang="Target language code, e.g. en, hi")
