@@ -1,4 +1,3 @@
 discord.py==2.3.2
 googletrans==4.0.0-rc1
-aiofiles
 deep-translator
