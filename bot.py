@@ -1,71 +1,105 @@
-# bot.py - crash-hardened translator using deep-translator
-import os, logging, asyncio
+import os
+import logging
+import asyncio
+import discord
 from discord import app_commands
+from googletrans import Translator
 from discord.ext import commands
-from deep_translator import GoogleTranslator
 
+# Logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 log = logging.getLogger("translator-bot")
 
-intents = commands.Intents.default()
+translator = Translator()
+
+intents = discord.Intents.default()
 intents.message_content = True
 
 bot = commands.Bot(command_prefix=".", intents=intents)
 
+
 async def safe_sync():
+    """Safely sync slash commands with retries."""
     for i in range(3):
         try:
             await bot.tree.sync()
             log.info("Slash commands synced")
             return
         except Exception as e:
-            log.warning("Sync failed (%s) - retrying", e)
+            log.warning(f"Sync attempt {i+1} failed: {e}")
             await asyncio.sleep(2)
-    log.error("Failed to sync slash commands after retries")
+    log.error("Failed to sync slash commands after 3 retries.")
+
 
 @bot.event
 async def on_ready():
-    log.info(f"Logged in as {bot.user} ({getattr(bot.user,'id',None)})")
+    log.info(f"Logged in as {bot.user} (ID: {bot.user.id})")
     await safe_sync()
 
-def translate_text(text, target="en"):
-    # deep-translator handles detection itself
-    return GoogleTranslator(source='auto', target=target).translate(text)
 
-@bot.tree.command(name="t", description="Translate a message privately using its message ID")
-@app_commands.describe(message_id="ID of the message to translate", lang="target language code (en, hi, etc.)")
-async def t(interaction: commands.Context, message_id: str, lang: str = "en"):
-    await interaction.response.defer(ephemeral=True)
+def translate_safe(text: str, target: str = "en"):
+    """Translate using googletrans with error handling."""
     try:
-        mid = int(message_id)
-    except:
-        await interaction.followup.send("Message ID must be a number.", ephemeral=True)
+        result = translator.translate(text, dest=target)
+        return result.text, result.src
+    except Exception as e:
+        log.error(f"Translation failed: {e}")
+        raise
+
+
+@bot.tree.command(
+    name="t",
+    description="Translate a message privately using its message ID.",
+)
+@app_commands.describe(
+    message_id="The ID of the message you want to translate",
+    lang="Target language (en, hi, es, etc.)"
+)
+async def translate_cmd(interaction: discord.Interaction, message_id: str, lang: str = "en"):
+
+    await interaction.response.defer(ephemeral=True)
+
+    # Validate ID
+    if not message_id.isdigit():
+        await interaction.followup.send("❌ Message ID must be a number.", ephemeral=True)
         return
 
+    mid = int(message_id)
+
+    # Attempt to fetch message
     try:
         msg = await interaction.channel.fetch_message(mid)
-    except Exception:
-        await interaction.followup.send("Could not find message (check channel/ID).", ephemeral=True)
+    except:
+        await interaction.followup.send("❌ Message not found in this channel.", ephemeral=True)
         return
 
+    # Ensure message has text
     if not msg.content or msg.content.strip() == "":
-        await interaction.followup.send("Target message has no text.", ephemeral=True)
+        await interaction.followup.send("❌ Message has no text to translate.", ephemeral=True)
         return
 
+    # Translate text
     try:
-        translated = translate_text(msg.content, target=lang)
-        await interaction.followup.send(f"🌍 Translated → {lang}\n\n{translated}", ephemeral=True)
-    except Exception as e:
-        log.exception("Translation error")
-        await interaction.followup.send("Translation service failed. Try again later.", ephemeral=True)
+        translated, src = translate_safe(msg.content, target=lang)
+    except:
+        await interaction.followup.send("❌ Translation failed. Try again later.", ephemeral=True)
+        return
+
+    # Reply privately
+    await interaction.followup.send(
+        f"🌍 **Translated ({src} → {lang})**\n\n{translated}",
+        ephemeral=True
+    )
+
 
 if __name__ == "__main__":
     TOKEN = os.getenv("TOKEN")
     if not TOKEN:
-        log.error("TOKEN not set")
-        raise SystemExit("Missing TOKEN")
+        log.error("TOKEN environment variable not set.")
+        raise SystemExit("TOKEN missing")
+
     try:
         bot.run(TOKEN)
-    except Exception:
-        log.exception("Bot failed to run")
+    except Exception as e:
+        log.error(f"Bot crashed: {e}")
         raise
