@@ -1,14 +1,15 @@
-# bot.py — Merged, crash-hardened, feature-rich translator + giveaway + nuke + setup UI
-# Requirements (recommended):
-#   discord.py==2.3.2
-#   googletrans==4.0.0-rc1
-#   deep-translator
+# bot.py — Fixed, merged, ready-to-deploy translator + giveaways + nuke + setup UI
+# Requirements suggested (requirements.txt):
+# discord.py==2.3.2
+# googletrans==4.0.0-rc1
+# deep-translator
+# aiohttp==3.8.4
 #
-# Put your bot token in env var TOKEN. Optionally set GUILD_ID for instant slash sync.
-# To enable prefix commands and auto-translate you must:
-#   1) set USE_MESSAGE_CONTENT_INTENT = True
-#   2) enable Message Content Intent for this app in Developer Portal
-#   3) ensure Railway TOKEN corresponds to that app (regenerate token if needed)
+# Put your token in env var TOKEN. Optionally set GUILD_ID for instant slash sync.
+# To enable prefix commands and auto-translate: set USE_MESSAGE_CONTENT_INTENT = True AND enable the privileged intent in Developer Portal.
+
+import warnings
+warnings.filterwarnings("ignore", message="PyNaCl is not installed")
 
 import os
 import json
@@ -34,7 +35,7 @@ COUNTDOWN_INTERVAL = 10  # seconds between countdown embed updates
 # --------------------------------
 
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s: %(message)s")
-log = logging.getLogger("bot-full")
+log = logging.getLogger("bot-fixed")
 
 os.makedirs(BACKUP_DIR, exist_ok=True)
 
@@ -43,13 +44,14 @@ GUILD_ID = os.getenv("GUILD_ID")
 GLOBAL_MODLOG_CHANNEL = os.getenv("MODLOG_CHANNEL_ID")
 
 if not TOKEN:
-    raise SystemExit("TOKEN not set in env")
+    raise SystemExit("TOKEN not set in environment variables.")
 
 # ---------- Intents & Bot ----------
 intents = discord.Intents.default()
 intents.message_content = USE_MESSAGE_CONTENT_INTENT
 bot = commands.Bot(command_prefix=".", intents=intents)
-# Remove default help (prevents CommandRegistrationError when registering custom help)
+
+# Remove default help (fixes CommandRegistrationError when adding custom help)
 try:
     bot.remove_command("help")
 except Exception:
@@ -92,7 +94,7 @@ def log_action(guild_id: int, action: str, data: Dict[str, Any]):
     entry = {"time": datetime.utcnow().isoformat(), "action": action, "data": data}
     state["modlog"].setdefault(gid, []).append(entry)
     save_json(MODLOG_FILE, state["modlog"])
-    # Optionally send to global modlog channel
+    # optionally post to global modlog channel
     if GLOBAL_MODLOG_CHANNEL:
         try:
             ch = bot.get_channel(int(GLOBAL_MODLOG_CHANNEL))
@@ -102,7 +104,6 @@ def log_action(guild_id: int, action: str, data: Dict[str, Any]):
             pass
 
 async def post_guild_modlog(guild: discord.Guild, text: str):
-    # per-guild modlog channel is stored under settings[guild_id]["_modlog_channel"]
     gsettings = state["settings"].get(str(guild.id), {})
     modch = gsettings.get("_modlog_channel") or gsettings.get("modlog_channel")
     if modch:
@@ -113,7 +114,6 @@ async def post_guild_modlog(guild: discord.Guild, text: str):
                 return
         except Exception:
             pass
-    # fallback to env var
     if GLOBAL_MODLOG_CHANNEL:
         ch = bot.get_channel(int(GLOBAL_MODLOG_CHANNEL))
         if ch:
@@ -145,7 +145,7 @@ def translate_text(text: str, dest: str) -> str:
             from deep_translator import GoogleTranslator as DT
             return DT(source="auto", target=dest).translate(text)
         except Exception:
-            raise RuntimeError("No translator library installed. Install googletrans or deep-translator.")
+            raise RuntimeError("No translator library installed (googletrans or deep-translator).")
 
 def ensure_settings_for_channel(guild_id: int, channel_id: int) -> Dict[str, Any]:
     gs = state.setdefault("settings", {})
@@ -186,7 +186,7 @@ async def on_ready():
                 log.exception("Error resuming giveaway %s", gid)
 
 # ---------- Setup command (ephemeral UI) ----------
-@tree.command(name="setup", description="Open setup UI for channel (ephemeral)")
+@tree.command(name="setup", description="Open channel setup UI (ephemeral)")
 @app_commands.describe(modlog_channel="Channel for mod logs (optional)", autotranslate="Enable auto-translate in this channel (requires message content intent)", default_lang="Default translation language code")
 async def slash_setup(interaction: discord.Interaction, modlog_channel: Optional[discord.TextChannel] = None, autotranslate: Optional[bool] = None, default_lang: Optional[str] = None):
     if not interaction.user.guild_permissions.manage_guild:
@@ -234,7 +234,7 @@ async def slash_setup(interaction: discord.Interaction, modlog_channel: Optional
             cfg = gs.setdefault(str(inter.channel.id), {"lang": "en", "autotranslate": False})
             cfg["autotranslate"] = not cfg.get("autotranslate", False)
             save_all()
-            await inter.response.send_message(f"Auto-translate set to {cfg['autotranslate']}. Note: auto-translate needs message_content intent to read messages.", ephemeral=True)
+            await inter.response.send_message(f"Auto-translate set to {cfg['autotranslate']}. Note: auto-translate needs message_content intent to function.", ephemeral=True)
 
     view = SetupView()
     text = "Settings updated: " + ", ".join(changed) if changed else "Open setup menu to configure this channel."
@@ -330,7 +330,6 @@ async def _announce_giveaway(channel: discord.TextChannel, info: Dict[str, Any])
     except Exception:
         pass
 
-    # add a button view for guaranteed entry
     class EnterView(discord.ui.View):
         def __init__(self, gid):
             super().__init__(timeout=None)
@@ -370,10 +369,8 @@ async def _run_countdown_task(gid: str, seconds: int):
             except Exception:
                 return
             remaining = int((datetime.fromisoformat(info["ends_at"]) - datetime.utcnow()).total_seconds())
-            # edit embed 'Ends In' field index 1 if exists
             try:
                 embed = msg.embeds[0] if msg.embeds else discord.Embed(title="🎉 Giveaway", description=info["prize"])
-                # find field 'Ends In' index
                 for i, f in enumerate(embed.fields):
                     if f.name == "Ends In":
                         embed.set_field_at(i, name="Ends In", value=human_td(remaining), inline=True)
@@ -409,7 +406,6 @@ async def _end_giveaway(gid: str):
         return
 
     entrants = set(info.get("entrants", []))
-    # collect reaction entrants
     for react in msg.reactions:
         emoji = getattr(react.emoji, "name", react.emoji)
         if emoji == "🎉":
@@ -422,7 +418,6 @@ async def _end_giveaway(gid: str):
     if entrants_list:
         k = min(int(info.get("winners", 1)), len(entrants_list))
         winners = random.sample(entrants_list, k)
-    # announce
     if winners:
         mentions = " ".join(f"<@{w}>" for w in winners)
         await ch.send(f"🎉 Giveaway {gid} ended! Winners: {mentions}\nPrize: **{info['prize']}**")
@@ -433,13 +428,11 @@ async def _end_giveaway(gid: str):
     save_all()
     log_action(int(info["guild_id"]), "giveaway_end", {"id": gid, "winners": winners, "prize": info.get("prize")})
 
-    # DM winners with claim button
     if winners:
         for w in winners:
             try:
                 user = await bot.fetch_user(int(w))
-                view = discord.ui.View(timeout=60*30)  # 30 minutes
-                class Claim(discord.ui.View):
+                class ClaimView(discord.ui.View):
                     def __init__(self, uid):
                         super().__init__(timeout=60*30)
                         self.uid = uid
@@ -450,16 +443,27 @@ async def _end_giveaway(gid: str):
                             return
                         await interaction.response.send_message("You claimed the prize. Contact staff.", ephemeral=True)
                         self.stop()
-                cview = Claim(int(w))
+                cview = ClaimView(int(w))
                 await user.send(f"🎉 You won giveaway {gid} — Prize: {info['prize']}", view=cview)
             except Exception:
                 pass
 
-# ---------- Giveaway group (app_commands.Group) ----------
+# ---------- Giveaway app_commands.Group ----------
 giveaway_group = app_commands.Group(name="giveaway", description="Giveaway commands (start/end/reroll/export)")
 
 @giveaway_group.command(name="start", description="Start a giveaway (Manage Server required)")
 @app_commands.describe(duration="Duration in seconds", winners="Number of winners", prize="Prize text", pin="Pin the giveaway message?")
 async def gw_start(interaction: discord.Interaction, duration: int, winners: int, prize: str, pin: Optional[bool] = False):
     if not interaction.user.guild_permissions.manage_guild:
-        await interaction.response.send_message
+        await interaction.response.send_message("Manage Server permission required.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    gid = _gen_gid()
+    info = {
+        "id": gid,
+        "prize": prize,
+        "winners": int(winners),
+        "duration": int(duration),
+        "channel_id": str(interaction.channel.id),
+        "message_id": None,
+        "ends_at": (datetime.utcnow() + timedelta(seconds=duration)).isoform
