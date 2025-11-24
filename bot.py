@@ -1,11 +1,5 @@
-# bot.py — Full working bot (slash + prefix), giveaways, nuke, help, prefix changer
-# Safe formatting to avoid "line merged" issues on small hosts.
-# Requirements (requirements.txt):
-# discord.py==2.3.2
-# googletrans==4.0.0-rc1
-# deep-translator
-# aiohttp==3.8.4
-# PyNaCl==1.5.0  (optional — if you install, the PyNaCl warning goes away)
+# bot.py — part 1/3
+# Safe mobile paste. Full bot (slash + prefix), giveaways, nuke, translate, setup.
 
 import warnings
 warnings.filterwarnings("ignore", message="PyNaCl is not installed")
@@ -23,12 +17,11 @@ import discord
 from discord.ext import commands
 from discord import app_commands, File
 
-# ----- tiny log filter for that PyNaCl warning -----
+# Filter exact PyNaCl warning from discord logger
 class _DropPyNaClFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         try:
-            msg = record.getMessage()
-            if "PyNaCl is not installed" in msg:
+            if "PyNaCl is not installed" in record.getMessage():
                 return False
         except Exception:
             pass
@@ -48,7 +41,7 @@ DEFAULT_PREFIX = "."
 # --------------------------------
 
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s: %(message)s")
-log = logging.getLogger("bot-full")
+log = logging.getLogger("bot-split")
 os.makedirs(BACKUP_DIR, exist_ok=True)
 
 TOKEN = os.getenv("TOKEN")
@@ -106,6 +99,7 @@ def human_td(seconds: int) -> str:
     return " ".join(parts)
 
 def translate_text(text: str, dest: str) -> str:
+    # delayed import to avoid startup failure if libs missing
     try:
         from googletrans import Translator as GT
         tr = GT()
@@ -169,7 +163,7 @@ async def post_guild_modlog(guild: discord.Guild, text: str):
         if ch:
             await ch.send(f"[{guild.name}] {text}")
 
-# ---------- On ready ----------
+# ---------- on_ready ----------
 @bot.event
 async def on_ready():
     log.info("Bot online: %s (id:%s)", bot.user, getattr(bot.user, "id", None))
@@ -197,17 +191,19 @@ async def on_ready():
             except Exception:
                 log.exception("Error resuming giveaway %s", gid)
 
-# ---------- Setup / setprefix ----------
+# ---------- setup & setprefix ----------
 @tree.command(name="setup", description="Open setup UI (managers only)")
 @app_commands.describe(
     modlog_channel="Channel for mod logs (optional)",
     autotranslate="Enable auto-translate in this channel",
     default_lang="Default language code (e.g. en)"
 )
-async def slash_setup(interaction: discord.Interaction,
-                      modlog_channel: Optional[discord.TextChannel] = None,
-                      autotranslate: Optional[bool] = None,
-                      default_lang: Optional[str] = None):
+async def slash_setup(
+    interaction: discord.Interaction,
+    modlog_channel: Optional[discord.TextChannel] = None,
+    autotranslate: Optional[bool] = None,
+    default_lang: Optional[str] = None
+):
     if not interaction.user.guild_permissions.manage_guild:
         await interaction.response.send_message("Manage Server permission required.", ephemeral=True)
         return
@@ -276,8 +272,9 @@ async def slash_setprefix(interaction: discord.Interaction, prefix: str):
     await interaction.response.send_message(f"Prefix updated to `{prefix}` (persistent).", ephemeral=True)
     await post_guild_modlog(interaction.guild, f"Prefix changed to {prefix} by {interaction.user}")
     log_action(interaction.guild.id, "prefix_change", {"by": str(interaction.user.id), "prefix": prefix})
+    # bot.py — part 2/3
 
-# ---------- Help ----------
+# ---------- help & translate ----------
 @tree.command(name="help", description="Show help (public)")
 async def slash_help(interaction: discord.Interaction):
     embed = discord.Embed(
@@ -308,10 +305,14 @@ async def slash_help(interaction: discord.Interaction):
     embed.set_footer(text="You can also use prefix commands like `.t <msg_id> en` if message content intent is enabled.")
     await interaction.response.send_message(embed=embed, ephemeral=False)
 
-# ---------- Translate ----------
 @tree.command(name="translate", description="Translate message by ID (public by default)")
 @app_commands.describe(message_id="Message ID to translate", channel="Channel containing message (optional)", lang="Language code (e.g. en)")
-async def slash_translate(interaction: discord.Interaction, message_id: str, channel: Optional[discord.TextChannel] = None, lang: str = "en"):
+async def slash_translate(
+    interaction: discord.Interaction,
+    message_id: str,
+    channel: Optional[discord.TextChannel] = None,
+    lang: str = "en"
+):
     await interaction.response.defer(ephemeral=False)
     target = channel or interaction.channel
     try:
@@ -334,7 +335,88 @@ async def slash_translate(interaction: discord.Interaction, message_id: str, cha
     except RuntimeError as e:
         await interaction.followup.send(str(e), ephemeral=True)
 
-# ---------- Giveaway core ----------
+# ---------- prefix help & message processing ----------
+@bot.command(name="help")
+async def prefix_help(ctx: commands.Context):
+    if not USE_MESSAGE_CONTENT_INTENT:
+        await ctx.reply("Prefix help disabled because message content intent is not enabled. Use /help instead.", mention_author=False)
+        return
+    p = (state.get("settings", {}).get(str(ctx.guild.id), {}) or {}).get("prefix") or DEFAULT_PREFIX
+    text = (
+        f"Prefix: `{p}`\n\n"
+        "Translate: `.t <message_id> <lang>`\n"
+        "Start giveaway (prefix): `.giveaway_start <duration_seconds> <winners> <prize>` (Manage Server)\n"
+        "Nuke (prefix): `.nuke` (Manage Channels)\n"
+        "Change prefix (slash): `/setprefix <prefix>`\n"
+        "Use `/help` for slash help."
+    )
+    await ctx.reply(text, mention_author=False)
+
+@bot.event
+async def on_message(message: discord.Message):
+    if message.author.bot:
+        return
+    # auto-translate if set for channel
+    try:
+        if message.guild:
+            gs = state.get("settings", {}).get(str(message.guild.id), {})
+            ch_cfg = gs.get(str(message.channel.id), {})
+            if ch_cfg and ch_cfg.get("autotranslate") and ch_cfg.get("lang"):
+                if USE_MESSAGE_CONTENT_INTENT:
+                    try:
+                        translated = translate_text(message.content, ch_cfg["lang"])
+                        await message.channel.send(
+                            f"🔁 Translation ({ch_cfg['lang']}): {translated}",
+                            reference=message
+                        )
+                    except Exception:
+                        pass
+    except Exception:
+        log.exception("Auto-translate error")
+
+    # let commands extension handle prefix commands if intent enabled
+    if USE_MESSAGE_CONTENT_INTENT:
+        await bot.process_commands(message)
+    else:
+        prefixes = await _prefix_callable(bot, message)
+        for p in prefixes:
+            if message.content.startswith(p):
+                try:
+                    await message.channel.send(
+                        "Prefix commands are disabled because Message Content Intent is not enabled on this bot. "
+                        "Use slash commands or enable the intent and set USE_MSG_CONTENT=true.",
+                        delete_after=12
+                    )
+                except Exception:
+                    pass
+                break
+
+# ---------- prefix translate command ----------
+@bot.command(name="t")
+async def prefix_translate(ctx: commands.Context, message_id: int, lang: str = "en"):
+    if not USE_MESSAGE_CONTENT_INTENT:
+        await ctx.reply("Prefix translate disabled (message content intent not enabled). Use /translate.", mention_author=False)
+        return
+    try:
+        msg = await ctx.channel.fetch_message(message_id)
+    except Exception:
+        await ctx.reply("Message not found.", mention_author=False)
+        return
+    content = getattr(msg, "content", None)
+    if not content:
+        await ctx.reply("Target message has no text.", mention_author=False)
+        return
+    try:
+        translated = translate_text(content, lang)
+        try:
+            await ctx.author.send(f"**Translation ({lang})**\n{translated}")
+            await ctx.reply("Sent translation to your DMs.", mention_author=False)
+        except Exception:
+            await ctx.reply(f"**Translation ({lang})**\n{translated}", mention_author=False)
+    except Exception as e:
+        await ctx.reply(f"Translation error: {e}", mention_author=False)
+
+# ---------- GIVEAWAY core ----------
 def _gen_gid() -> str:
     return str(random.randint(100000, 999999))
 
@@ -391,18 +473,14 @@ async def _run_countdown_task(gid: str, seconds: int):
             except Exception:
                 return
 
-            # safe embed handling (was causing the 'merged line' issue)
+            # safe embed handling
             if msg.embeds:
                 embed = msg.embeds[0]
             else:
-                embed = discord.Embed(
-                    title="🎉 Giveaway",
-                    description=info.get("prize", "")
-                )
+                embed = discord.Embed(title="🎉 Giveaway", description=info.get("prize", ""))
 
             remaining = int((datetime.fromisoformat(info["ends_at"]) - datetime.utcnow()).total_seconds())
             try:
-                # update Ends In field
                 found = False
                 for i, f in enumerate(embed.fields):
                     if f.name == "Ends In":
@@ -466,7 +544,6 @@ async def _end_giveaway(gid: str):
     save_all()
     log_action(int(info["guild_id"]), "giveaway_end", {"id": gid, "winners": winners, "prize": info.get("prize")})
 
-    # DM winners with claim button
     if winners:
         for w in winners:
             try:
@@ -486,11 +563,291 @@ async def _end_giveaway(gid: str):
                 await user.send(f"🎉 You won giveaway {gid} — Prize: {info['prize']}", view=cview)
             except Exception:
                 pass
+                # bot.py — part 3/3
 
 # ---------- Giveaway commands ----------
 giveaway_group = app_commands.Group(name="giveaway", description="Giveaway commands")
 
 @giveaway_group.command(name="start", description="Start a giveaway (Manage Server)")
 @app_commands.describe(duration="Duration seconds", winners="Number of winners", prize="Prize text", pin="Pin message?")
-async def gw_start(interaction: discord.Interaction, duration: int, winners: int, prize: str, pin: Optional[bool] = False):
-    if not interaction.user.guild_permissions.manage_
+async def gw_start(
+    interaction: discord.Interaction,
+    duration: int,
+    winners: int,
+    prize: str,
+    pin: Optional[bool] = False
+):
+    if not interaction.user.guild_permissions.manage_guild:
+        await interaction.response.send_message("Manage Server permission required.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    gid = _gen_gid()
+    info = {
+        "id": gid,
+        "prize": prize,
+        "winners": int(winners),
+        "duration": int(duration),
+        "channel_id": str(interaction.channel.id),
+        "message_id": None,
+        "ends_at": (datetime.utcnow() + timedelta(seconds=duration)).isoformat(),
+        "active": True,
+        "guild_id": str(interaction.guild.id),
+        "entrants": []
+    }
+    msg = await _announce_giveaway(interaction.channel, info)
+    info["message_id"] = str(msg.id)
+    state.setdefault("giveaways", {})[gid] = info
+    save_all()
+    asyncio.create_task(_run_countdown_task(gid, duration))
+    if pin:
+        try:
+            await msg.pin()
+        except Exception:
+            pass
+    await interaction.followup.send(f"Giveaway started (ID: {gid}). Ends in {human_td(duration)}", ephemeral=True)
+    await post_guild_modlog(interaction.guild, f"Giveaway {gid} started by {interaction.user} — {prize}")
+    log_action(interaction.guild.id, "giveaway_start", {"id": gid, "prize": prize, "winners": winners})
+
+@giveaway_group.command(name="end", description="End giveaway early (Manage Server)")
+async def gw_end(interaction: discord.Interaction, giveaway_id: str):
+    if not interaction.user.guild_permissions.manage_guild:
+        await interaction.response.send_message("Manage Server permission required.", ephemeral=True)
+        return
+    if giveaway_id not in state.get("giveaways", {}):
+        await interaction.response.send_message("Giveaway ID not found", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    await _end_giveaway(giveaway_id)
+    await interaction.followup.send("Giveaway ended.", ephemeral=True)
+    await post_guild_modlog(interaction.guild, f"Giveaway {giveaway_id} ended by {interaction.user}")
+    log_action(interaction.guild.id, "giveaway_end_manual", {"id": giveaway_id, "by": str(interaction.user.id)})
+
+@giveaway_group.command(name="reroll", description="Reroll winners (Manage Server)")
+async def gw_reroll(interaction: discord.Interaction, giveaway_id: str, winners: Optional[int] = None):
+    if not interaction.user.guild_permissions.manage_guild:
+        await interaction.response.send_message("Manage Server permission required.", ephemeral=True)
+        return
+    info = state.get("giveaways", {}).get(giveaway_id)
+    if not info:
+        await interaction.response.send_message("Giveaway not found", ephemeral=True)
+        return
+    entrants = set(info.get("entrants", []))
+    ch = bot.get_channel(int(info["channel_id"]))
+    try:
+        msg = await ch.fetch_message(int(info["message_id"]))
+        for react in msg.reactions:
+            if getattr(react.emoji, "name", react.emoji) == "🎉":
+                async for u in react.users():
+                    if u.bot:
+                        continue
+                    entrants.add(str(u.id))
+    except Exception:
+        pass
+    entrants_list = list(entrants)
+    if not entrants_list:
+        await interaction.response.send_message("No entrants to reroll", ephemeral=True)
+        return
+    k = winners or info.get("winners", 1)
+    k = min(len(entrants_list), int(k))
+    new_winners = random.sample(entrants_list, k)
+    mentions = " ".join(f"<@{w}>" for w in new_winners)
+    await interaction.response.send_message(f"🎉 Reroll winners: {mentions}", ephemeral=True)
+    await post_guild_modlog(interaction.guild, f"Giveaway {giveaway_id} rerolled by {interaction.user} — winners: {mentions}")
+    log_action(interaction.guild.id, "giveaway_reroll", {"id": giveaway_id, "winners": new_winners})
+
+@giveaway_group.command(name="export", description="Export entrants as CSV (Manage Server)")
+async def gw_export(interaction: discord.Interaction, giveaway_id: str):
+    if not interaction.user.guild_permissions.manage_guild:
+        await interaction.response.send_message("Manage Server permission required.", ephemeral=True)
+        return
+    info = state.get("giveaways", {}).get(giveaway_id)
+    if not info:
+        await interaction.response.send_message("Giveaway not found", ephemeral=True)
+        return
+    entrants = set(info.get("entrants", []))
+    ch = bot.get_channel(int(info["channel_id"]))
+    try:
+        msg = await ch.fetch_message(int(info["message_id"]))
+        for react in msg.reactions:
+            if getattr(react.emoji, "name", react.emoji) == "🎉":
+                async for u in react.users():
+                    if u.bot:
+                        continue
+                    entrants.add(str(u.id))
+    except Exception:
+        pass
+    csv_path = os.path.join(BACKUP_DIR, f"give_{giveaway_id}_{int(datetime.utcnow().timestamp())}.csv")
+    try:
+        with open(csv_path, "w", newline='', encoding="utf-8") as cf:
+            writer = csv.writer(cf)
+            writer.writerow(["user_id", "exported_at"])
+            for uid in entrants:
+                writer.writerow([uid, datetime.utcnow().isoformat()])
+        await interaction.response.send_message("CSV exported — sending file...", ephemeral=True)
+        await interaction.followup.send(file=File(csv_path))
+        log_action(interaction.guild.id, "giveaway_export", {"id": giveaway_id, "file": csv_path})
+    except Exception as e:
+        await interaction.response.send_message("Export failed: " + str(e), ephemeral=True)
+
+tree.add_command(giveaway_group)
+
+# ---------- Nuke ----------
+class NukeView(discord.ui.View):
+    def __init__(self, author_id: int, channel: discord.TextChannel, backup_count: int = 200, timeout: int = 60):
+        super().__init__(timeout=timeout)
+        self.author_id = author_id
+        self.channel = channel
+        self.backup_count = backup_count
+        self.value: Optional[bool] = None
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message("Only the invoker may confirm/cancel.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Confirm Nuke", style=discord.ButtonStyle.danger)
+    async def confirm(self, button: discord.ui.Button, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        self.value = True
+        self.stop()
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, button: discord.ui.Button, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        self.value = False
+        self.stop()
+
+async def backup_channel_messages(channel: discord.TextChannel, limit: int = 200) -> str:
+    fname = os.path.join(BACKUP_DIR, f"backup_{channel.guild.id}_{channel.id}_{int(datetime.utcnow().timestamp())}.txt")
+    try:
+        msgs = []
+        async for m in channel.history(limit=limit, oldest_first=True):
+            t = m.created_at.isoformat()
+            author = f"{m.author} ({m.author.id})"
+            content = m.content or ""
+            msgs.append(f"[{t}] {author}: {content}\n")
+        with open(fname, "w", encoding="utf-8") as f:
+            f.writelines(msgs)
+        return fname
+    except Exception:
+        log.exception("Backup failed")
+        return ""
+
+async def duplicate_and_optionally_delete(channel: discord.TextChannel, actor: discord.Member, delete_old: bool = True):
+    guild = channel.guild
+    overwrites = channel.overwrites
+    category = channel.category
+    topic = channel.topic or ""
+    name = channel.name
+    new = await guild.create_text_channel(name, overwrites=overwrites, topic=topic, category=category)
+    try:
+        await new.edit(position=channel.position)
+    except Exception:
+        pass
+    await new.send(f"💥 Channel nuked by <@{actor.id}> — this is the fresh copy.")
+    if delete_old:
+        try:
+            await channel.delete(reason=f"Nuked by {actor}")
+        except Exception:
+            await new.send("Failed to delete old channel.")
+    return new
+
+@tree.command(name="nuke", description="Preview then duplicate & optionally delete this channel (Manage Channels)")
+@app_commands.describe(backup_count="Messages to backup (default 200)", delete_old="Delete old channel after duplicate?")
+async def slash_nuke(interaction: discord.Interaction, backup_count: Optional[int] = 200, delete_old: Optional[bool] = True):
+    if not interaction.user.guild_permissions.manage_channels:
+        await interaction.response.send_message("Manage Channels permission required.", ephemeral=True)
+        return
+    ch = interaction.channel
+    try:
+        count = 0
+        async for _ in ch.history(limit=1000):
+            count += 1
+    except Exception:
+        count = -1
+    desc = f"Channel: {ch.mention}\nMessages approx: {count if count >= 0 else 'unknown'}\nThis will backup last {backup_count} messages."
+    view = NukeView(interaction.user.id, ch, backup_count=backup_count)
+    await interaction.response.send_message(desc, ephemeral=True, view=view)
+    await view.wait()
+    if view.value is True:
+        backup_path = await backup_channel_messages(ch, limit=backup_count)
+        new = await duplicate_and_optionally_delete(ch, interaction.user, delete_old=delete_old)
+        if backup_path:
+            try:
+                await interaction.followup.send("Nuke completed. Backup attached.", ephemeral=True)
+                await interaction.followup.send(file=File(backup_path))
+            except Exception:
+                pass
+        else:
+            await interaction.followup.send("Nuke completed.", ephemeral=True)
+        await post_guild_modlog(interaction.guild, f"Channel {ch.name} nuked by {interaction.user}. Backup: {backup_path}")
+        log_action(interaction.guild.id, "nuke", {"channel": str(ch.id), "by": str(interaction.user.id), "backup": backup_path})
+    else:
+        await interaction.followup.send("Nuke cancelled.", ephemeral=True)
+
+# ---------- Prefix nuke ----------
+@bot.command(name="nuke")
+async def prefix_nuke(ctx: commands.Context, backup_count: Optional[int] = 200, delete_old: Optional[bool] = True):
+    if not USE_MESSAGE_CONTENT_INTENT:
+        await ctx.reply("Prefix nuke disabled (Message Content Intent not enabled). Use /nuke.", mention_author=False)
+        return
+    if not ctx.author.guild_permissions.manage_channels:
+        await ctx.reply("Manage Channels permission required.", mention_author=False)
+        return
+    view = NukeView(ctx.author.id, ctx.channel, backup_count=backup_count)
+    msg = await ctx.reply("Confirm nuke? This will backup and duplicate the channel.", view=view)
+    await view.wait()
+    if view.value is True:
+        backup_path = await backup_channel_messages(ctx.channel, limit=backup_count)
+        new = await duplicate_and_optionally_delete(ctx.channel, ctx.author, delete_old=delete_old)
+        await ctx.send("Nuke completed.")
+        if backup_path:
+            await ctx.send(file=File(backup_path))
+        log_action(ctx.guild.id, "nuke", {"channel": str(ctx.channel.id), "by": str(ctx.author.id), "backup": backup_path})
+    else:
+        await ctx.send("Nuke cancelled.")
+
+# ---------- Modlog & Dump ----------
+@tree.command(name="modlog", description="Show recent moderation logs (ephemeral, Manage Server)")
+async def slash_modlog(interaction: discord.Interaction, limit: int = 5):
+    if not interaction.user.guild_permissions.manage_guild:
+        await interaction.response.send_message("Manage Server permission required.", ephemeral=True)
+        return
+    logs = state.get("modlog", {}).get(str(interaction.guild.id), [])
+    if not logs:
+        await interaction.response.send_message("No modlog entries.", ephemeral=True)
+        return
+    out = logs[-limit:]
+    text = "\n".join(f"{e['time']} — {e['action']} — {e['data']}" for e in out)
+    await interaction.response.send_message(f"Recent modlog:\n```\n{text}\n```", ephemeral=True)
+
+@tree.command(name="dump", description="Dump settings & giveaways (ephemeral, Manage Server)")
+async def slash_dump(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.manage_guild:
+        await interaction.response.send_message("Manage Server permission required.", ephemeral=True)
+        return
+    sfile = os.path.join(BACKUP_DIR, f"settings_{interaction.guild.id}_{int(datetime.utcnow().timestamp())}.json")
+    gfile = os.path.join(BACKUP_DIR, f"giveaways_{interaction.guild.id}_{int(datetime.utcnow().timestamp())}.json")
+    with open(sfile, "w", encoding="utf-8") as f:
+        json.dump(state.get("settings", {}), f, indent=2, ensure_ascii=False)
+    with open(gfile, "w", encoding="utf-8") as f:
+        json.dump(state.get("giveaways", {}), f, indent=2, ensure_ascii=False)
+    await interaction.response.send_message("Dump created — sending...", ephemeral=True)
+    await interaction.followup.send("Settings:", file=File(sfile))
+    await interaction.followup.send("Giveaways:", file=File(gfile))
+
+# ---------- Graceful shutdown & run ----------
+async def _on_shutdown():
+    save_all()
+    log.info("Saved state on shutdown")
+
+if __name__ == "__main__":
+    try:
+        bot.run(TOKEN)
+    except KeyboardInterrupt:
+        asyncio.run(_on_shutdown())
+    except Exception as e:
+        log.exception("Bot crashed: %s", e)
+        save_all()
+        raise
