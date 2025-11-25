@@ -1,15 +1,12 @@
-# bot.py — part 1/3
-# Safe mobile paste. Full bot (slash + prefix), giveaways, nuke, translate, setup.
-
-import warnings
-warnings.filterwarnings("ignore", message="PyNaCl is not installed")
+# bot.py — PART 1/2
+# Full Discord bot (paste Part1 then Part2)
 
 import os
 import json
 import csv
 import random
-import logging
 import asyncio
+import logging
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List
 
@@ -17,49 +14,46 @@ import discord
 from discord.ext import commands
 from discord import app_commands, File
 
-# Filter exact PyNaCl warning from discord logger
-class _DropPyNaClFilter(logging.Filter):
-    def filter(self, record: logging.LogRecord) -> bool:
-        try:
-            if "PyNaCl is not installed" in record.getMessage():
-                return False
-        except Exception:
-            pass
-        return True
-
-logging.getLogger("discord").addFilter(_DropPyNaClFilter())
-
-# ---------- CONFIG ----------
-LOG_LEVEL = logging.INFO
-USE_MESSAGE_CONTENT_INTENT = os.getenv("USE_MSG_CONTENT", "false").lower() == "true"
+# ---------- config ----------
 SETTINGS_FILE = "settings.json"
 GIVE_FILE = "giveaways.json"
 MODLOG_FILE = "modlog.json"
 BACKUP_DIR = "backups"
-COUNTDOWN_INTERVAL = 10
-DEFAULT_PREFIX = "."
-# --------------------------------
 
-logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s: %(message)s")
-log = logging.getLogger("bot-split")
 os.makedirs(BACKUP_DIR, exist_ok=True)
 
 TOKEN = os.getenv("TOKEN")
-GUILD_ID = os.getenv("GUILD_ID")
-GLOBAL_MODLOG_CHANNEL = os.getenv("MODLOG_CHANNEL_ID")
-
 if not TOKEN:
-    raise SystemExit("TOKEN environment variable not set")
+    raise SystemExit("Missing TOKEN env var")
 
-# ---------- Persistence ----------
+USE_MESSAGE_CONTENT_INTENT = os.getenv("USE_MSG_CONTENT", "false").lower() == "true"
+GUILD_ID = os.getenv("GUILD_ID")  # optional, for guild-only slash sync
+
+# ---------- logging ----------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+log = logging.getLogger("bot")
+
+# ---------- intents ----------
+intents = discord.Intents.default()
+intents.guilds = True
+intents.members = True
+intents.message_content = USE_MESSAGE_CONTENT_INTENT
+
+# ---------- bot ----------
+def _prefix_callable(bot, message):
+    if not message.guild:
+        return "."
+    gs = STATE.get("settings", {}).get(str(message.guild.id), {})
+    return gs.get("prefix", ".")
+bot = commands.Bot(command_prefix=_prefix_callable, intents=intents, help_command=None)
+tree = bot.tree
+
+# ---------- persistence ----------
 def load_json(path: str) -> Dict[str, Any]:
     try:
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
-    except FileNotFoundError:
-        return {}
-    except Exception as e:
-        log.warning("Failed to load %s: %s", path, e)
+    except Exception:
         return {}
 
 def save_json(path: str, data: Dict[str, Any]):
@@ -69,41 +63,121 @@ def save_json(path: str, data: Dict[str, Any]):
     except Exception as e:
         log.error("Failed to save %s: %s", path, e)
 
-state = {
+STATE = {
     "settings": load_json(SETTINGS_FILE),
     "giveaways": load_json(GIVE_FILE),
     "modlog": load_json(MODLOG_FILE),
+    "afk": {}
 }
 
 def save_all():
-    save_json(SETTINGS_FILE, state.get("settings", {}))
-    save_json(GIVE_FILE, state.get("giveaways", {}))
-    save_json(MODLOG_FILE, state.get("modlog", {}))
+    save_json(SETTINGS_FILE, STATE.get("settings", {}))
+    save_json(GIVE_FILE, STATE.get("giveaways", {}))
+    save_json(MODLOG_FILE, STATE.get("modlog", {}))
 
-# ---------- Utilities ----------
+# ---------- helpers ----------
 def human_td(seconds: int) -> str:
-    seconds = max(0, int(seconds))
-    td = timedelta(seconds=seconds)
-    days = td.days
-    hrs, rem = divmod(td.seconds, 3600)
-    mins, secs = divmod(rem, 60)
+    s = max(0, int(seconds))
+    td = timedelta(seconds=s)
     parts: List[str] = []
-    if days:
-        parts.append(f"{days}d")
-    if hrs:
-        parts.append(f"{hrs}h")
-    if mins:
-        parts.append(f"{mins}m")
-    if secs or not parts:
-        parts.append(f"{secs}s")
+    if td.days:
+        parts.append(f"{td.days}d")
+    h, rem = divmod(td.seconds, 3600)
+    m, sec = divmod(rem, 60)
+    if h: parts.append(f"{h}h")
+    if m: parts.append(f"{m}m")
+    if sec or not parts: parts.append(f"{sec}s")
     return " ".join(parts)
 
 def translate_text(text: str, dest: str) -> str:
-    # delayed import to avoid startup failure if libs missing
+    # try googletrans first, fallback to deep-translator
     try:
         from googletrans import Translator as GT
-        tr = GT()
-        res = tr.translate(text, dest=dest)
+        t = GT()
+        r = t.translate(text, dest=dest)
+        return getattr(r, "text", str(r))
+    except Exception:
+        try:
+            from deep_translator import GoogleTranslator as DT
+            return DT(source="auto", target=dest).translate(text)
+        except Exception:
+            raise RuntimeError("No translator library available (install googletrans or deep-translator)")
+
+def log_action(guild_id: int, action: str, data: Dict[str, Any]):
+    gid = str(guild_id)
+    STATE.setdefault("modlog", {}).setdefault(gid, []).append({
+        "time": datetime.utcnow().isoformat(),
+        "action": action,
+        "data": data
+    })
+    save_all()
+    # also attempt to post to per-guild modlog channel if set
+    try:
+        gs = STATE.get("settings", {}).get(gid, {})
+        ch_id = gs.get("_modlog_channel")
+        if ch_id:
+            ch = bot.get_channel(int(ch_id))
+            if ch:
+                asyncio.create_task(ch.send(f"[{datetime.utcnow().isoformat()}] {action} — {data}"))
+    except Exception:
+        pass
+
+# ---------- on_ready ----------
+@bot.event
+async def on_ready():
+    log.info("Bot ready: %s (%s)", bot.user, bot.user.id)
+    # sync slash commands (global unless GUILD_ID set)
+    try:
+        if GUILD_ID:
+            gobj = discord.Object(id=int(GUILD_ID))
+            await tree.sync(guild=gobj)
+            log.info("Synced slash commands to guild %s", GUILD_ID)
+        else:
+            await tree.sync()
+            log.info("Synced slash commands (global)")
+    except Exception as e:
+        log.warning("Slash sync problem: %s", e)
+
+# ---------- Setup slash ----------
+@tree.command(name="setup", description="Open setup for this channel (managers only)")
+@app_commands.describe(default_lang="Default language code (e.g. en)", autotranslate="Enable auto-translate for this channel")
+async def slash_setup(interaction: discord.Interaction, default_lang: Optional[str] = None, autotranslate: Optional[bool] = None):
+    if not interaction.user.guild_permissions.manage_guild:
+        await interaction.response.send_message("Manage Server permission required.", ephemeral=True)
+        return
+    gid = str(interaction.guild.id)
+    gs = STATE.setdefault("settings", {}).setdefault(gid, {})
+    chcfg = gs.setdefault(str(interaction.channel.id), {"lang": "en", "autotranslate": False})
+    changed = []
+    if default_lang:
+        chcfg["lang"] = default_lang
+        changed.append(f"default_lang -> {default_lang}")
+    if autotranslate is not None:
+        chcfg["autotranslate"] = bool(autotranslate)
+        changed.append(f"autotranslate -> {chcfg['autotranslate']}")
+    save_all()
+
+    class V(discord.ui.View):
+        @discord.ui.button(label="Set English", style=discord.ButtonStyle.secondary)
+        async def b1(self, button, inter):
+            gs = STATE.setdefault("settings", {}).setdefault(str(inter.guild.id), {})
+            gs.setdefault(str(inter.channel.id), {})["lang"] = "en"
+            save_all()
+            await inter.response.send_message("Channel language set to English.", ephemeral=True)
+
+        @discord.ui.button(label="Toggle Auto-Translate", style=discord.ButtonStyle.primary)
+        async def b2(self, button, inter):
+            gs = STATE.setdefault("settings", {}).setdefault(str(inter.guild.id), {})
+            cfg = gs.setdefault(str(inter.channel.id), {"lang": "en", "autotranslate": False})
+            cfg["autotranslate"] = not cfg.get("autotranslate", False)
+            save_all()
+            await inter.response.send_message(f"Auto-translate set to {cfg['autotranslate']}.", ephemeral=True)
+
+    await interaction.response.send_message(
+        "Settings updated." if changed else "Open setup menu.",
+        ephemeral=True, view=V()
+    )
+    log_action(interaction.guild.id, "setup", {"by": str(interaction.user.id), "changes": changed})        res = tr.translate(text, dest=dest)
         return getattr(res, "text", str(res))
     except Exception:
         try:
